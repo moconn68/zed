@@ -9,6 +9,7 @@ use gpui::EdgesRefinement;
 use gpui::HitboxBehavior;
 use gpui::UnderlineStyle;
 use language::LanguageName;
+use language::language_settings::AllLanguageSettings;
 
 use log::Level;
 use mermaid::{
@@ -1624,6 +1625,16 @@ impl ParsedMarkdown {
     }
 }
 
+fn code_block_tab_size(language: Option<&Arc<Language>>, cx: &App) -> usize {
+    AllLanguageSettings::try_get(cx).map_or(MarkdownEscaper::TAB_SIZE, |settings| {
+        let language_name = language.map(|language| language.name());
+        settings
+            .language(None, language_name.as_ref(), cx)
+            .tab_size
+            .get() as usize
+    })
+}
+
 struct PendingCodeBlock<'a> {
     language: Arc<Language>,
     texts: Vec<(Range<usize>, &'a str)>,
@@ -2190,7 +2201,7 @@ impl MarkdownElement {
             let mut metadata_block = div().w_full().rounded_md();
             metadata_block.style().refine(&self.style.code_block);
             builder.push_text_style(self.style.code_block.text.to_owned());
-            builder.push_code_block(None);
+            builder.push_code_block(None, code_block_tab_size(None, cx));
             builder.push_div(metadata_block, content_range, markdown_end);
             builder.push_text(&source[content_range.clone()], content_range.clone());
             builder.trim_trailing_newline();
@@ -2880,7 +2891,8 @@ impl Element for MarkdownElement {
                                         });
 
                                     builder.push_text_style(self.style.code_block.text.to_owned());
-                                    builder.push_code_block(language);
+                                    let tab_size = code_block_tab_size(language.as_ref(), cx);
+                                    builder.push_code_block(language, tab_size);
                                     builder.push_div(code_block, range, markdown_end);
                                 }
                                 (CodeBlockRenderer::Custom { .. }, _) => {}
@@ -3764,6 +3776,7 @@ struct MarkdownElementBuilder {
     base_text_style: TextStyle,
     text_style_stack: Vec<TextStyleRefinement>,
     code_block_stack: Vec<Option<Arc<Language>>>,
+    code_block_tab_size: usize,
     code_block_highlights: Arc<CodeBlockHighlights>,
     link_depth: usize,
     list_stack: Vec<ListStackEntry>,
@@ -3854,6 +3867,8 @@ struct PendingLine {
     /// Rendered (not source) indices, so chips hug the glyphs and ignore
     /// unrendered characters like the surrounding backticks
     code_chips: Vec<(Range<usize>, Hsla)>,
+    /// Rendered ranges of the spaces each code block tab was expanded into
+    expanded_tabs: Vec<Range<usize>>,
 }
 
 struct ListStackEntry {
@@ -3885,6 +3900,7 @@ impl MarkdownElementBuilder {
             base_text_style,
             text_style_stack: Vec::new(),
             code_block_stack: Vec::new(),
+            code_block_tab_size: MarkdownEscaper::TAB_SIZE,
             code_block_highlights,
             link_depth: 0,
             list_stack: Vec::new(),
@@ -4101,8 +4117,9 @@ impl MarkdownElementBuilder {
         self.list_stack.pop();
     }
 
-    fn push_code_block(&mut self, language: Option<Arc<Language>>) {
+    fn push_code_block(&mut self, language: Option<Arc<Language>>, tab_size: usize) {
         self.code_block_stack.push(language);
+        self.code_block_tab_size = tab_size;
     }
 
     fn pop_code_block(&mut self) {
@@ -4135,8 +4152,10 @@ impl MarkdownElementBuilder {
     }
 
     fn push_text(&mut self, text: &str, source_range: Range<usize>) {
+        let rendered_start = self.pending_line.text.len();
+        let first_run_index = self.pending_line.runs.len();
         self.pending_line.source_mappings.push(SourceMapping {
-            rendered_index: self.pending_line.text.len(),
+            rendered_index: rendered_start,
             source_index: source_range.start,
         });
         self.pending_line.text.push_str(text);
@@ -4182,6 +4201,72 @@ impl MarkdownElementBuilder {
             }
         } else {
             self.pending_line.runs.push(text_style.to_run(text.len()));
+        }
+
+        if !self.code_block_stack.is_empty() && text.contains('\t') {
+            self.expand_code_block_tabs(rendered_start, first_run_index, source_range);
+        }
+    }
+
+    /// Platform text systems disagree on how wide a `\t` is (DirectWrite gives it no
+    /// width at all), so code blocks expand tabs to spaces like the editor does.
+    fn expand_code_block_tabs(
+        &mut self,
+        rendered_start: usize,
+        first_run_index: usize,
+        source_range: Range<usize>,
+    ) {
+        let tab_size = self.code_block_tab_size.max(1);
+        let pending_line = &mut self.pending_line;
+        let text = pending_line.text.split_off(rendered_start);
+        // Substituted text doesn't correspond byte-for-byte to its source, so there's no
+        // source offset to map the text after each tab back to.
+        let maps_source_exactly = text.len() == source_range.len();
+        let mut column = pending_line
+            .text
+            .rsplit('\n')
+            .next()
+            .map_or(0, |line| line.chars().count());
+        let mut run_index = first_run_index;
+        let mut run_bytes_remaining = pending_line.runs.get(run_index).map_or(0, |run| run.len);
+
+        for (offset, character) in text.char_indices() {
+            while run_bytes_remaining == 0 && run_index + 1 < pending_line.runs.len() {
+                run_index += 1;
+                run_bytes_remaining = pending_line.runs.get(run_index).map_or(0, |run| run.len);
+            }
+            run_bytes_remaining = run_bytes_remaining.saturating_sub(character.len_utf8());
+
+            match character {
+                '\t' => {
+                    let tab_len = tab_size - column % tab_size;
+                    let tab_start = pending_line.text.len();
+                    pending_line.text.extend(std::iter::repeat_n(' ', tab_len));
+                    pending_line
+                        .expanded_tabs
+                        .push(tab_start..pending_line.text.len());
+                    if let Some(run) = pending_line.runs.get_mut(run_index) {
+                        run.len += tab_len - 1;
+                    }
+                    column += tab_len;
+
+                    let next_offset = offset + character.len_utf8();
+                    if maps_source_exactly && next_offset < text.len() {
+                        pending_line.source_mappings.push(SourceMapping {
+                            rendered_index: pending_line.text.len(),
+                            source_index: source_range.start + next_offset,
+                        });
+                    }
+                }
+                '\n' => {
+                    pending_line.text.push(character);
+                    column = 0;
+                }
+                _ => {
+                    pending_line.text.push(character);
+                    column += 1;
+                }
+            }
         }
     }
 
@@ -4269,6 +4354,7 @@ impl MarkdownElementBuilder {
             text_align: TextAlign::Left,
             highlights: SmallVec::new(),
             code_chips: SmallVec::new(),
+            expanded_tabs: Vec::new(),
         }));
         div()
             .absolute()
@@ -4308,6 +4394,7 @@ impl MarkdownElementBuilder {
             text_align,
             highlights,
             code_chips: line.code_chips.into_iter().collect(),
+            expanded_tabs: line.expanded_tabs,
         });
         self.rendered_lines.push(rendered_line.clone());
         self.append_child(
@@ -4416,9 +4503,25 @@ struct RenderedLine {
     highlights: SmallVec<[(Range<usize>, Hsla); 1]>,
     /// Inline code chip ranges intersecting this line, in rendered indices
     code_chips: SmallVec<[(Range<usize>, Hsla); 1]>,
+    /// Rendered ranges of the spaces each code block tab was expanded into
+    expanded_tabs: Vec<Range<usize>>,
 }
 
 impl RenderedLine {
+    /// Code block tabs are rendered as spaces, but copied text should keep the original tabs.
+    fn push_copied_text(&self, rendered_range: Range<usize>, output: &mut String) {
+        let text = self.layout.text();
+        let mut copied_until = rendered_range.start;
+        for tab_range in &self.expanded_tabs {
+            if tab_range.start >= copied_until && tab_range.end <= rendered_range.end {
+                output.push_str(&text[copied_until..tab_range.start]);
+                output.push('\t');
+                copied_until = tab_range.end;
+            }
+        }
+        output.push_str(&text[copied_until..rendered_range.end]);
+    }
+
     /// Painted before the glyphs so the text renders on top of the chips
     fn paint_code_chips(&self, window: &mut Window) {
         const CHIP_CORNER_RADIUS: Pixels = px(4.);
@@ -4626,14 +4729,25 @@ impl RenderedLine {
             return self.source_end;
         }
 
-        let mapping = match self
+        match self
             .source_mappings
             .binary_search_by_key(&rendered_index, |probe| probe.rendered_index)
         {
-            Ok(ix) => &self.source_mappings[ix],
-            Err(ix) => &self.source_mappings[ix - 1],
-        };
-        mapping.source_index + (rendered_index - mapping.rendered_index)
+            Ok(ix) => self.source_mappings[ix].source_index,
+            Err(ix) => self.source_index_within_segment(ix - 1, rendered_index),
+        }
+    }
+
+    /// A segment can render longer than its source (e.g. an expanded tab in a code block), so
+    /// offsets past the end of its source are clamped to where the next segment's source begins.
+    fn source_index_within_segment(&self, segment_ix: usize, rendered_index: usize) -> usize {
+        let mapping = &self.source_mappings[segment_ix];
+        let source_index = mapping.source_index + (rendered_index - mapping.rendered_index);
+        let next_source_start = self
+            .source_mappings
+            .get(segment_ix + 1)
+            .map_or(self.source_end, |next_mapping| next_mapping.source_index);
+        source_index.min(next_source_start)
     }
 
     /// Returns the source index for use as an exclusive range end at a word/selection boundary.
@@ -4650,10 +4764,7 @@ impl RenderedLine {
             .binary_search_by_key(&rendered_index, |probe| probe.rendered_index)
         {
             Ok(ix) => ix,
-            Err(ix) => {
-                return self.source_mappings[ix - 1].source_index
-                    + (rendered_index - self.source_mappings[ix - 1].rendered_index);
-            }
+            Err(ix) => return self.source_index_within_segment(ix - 1, rendered_index),
         };
 
         // Exact match at the start of a segment. Check if there's a gap from the previous segment.
@@ -5060,7 +5171,7 @@ impl RenderedText {
             }
             .min(text.len());
 
-            accumulator.push_str(&text[start..end]);
+            line.push_copied_text(start..end, &mut accumulator);
             accumulator.push('\n');
         }
         // Remove trailing newline
@@ -5491,6 +5602,104 @@ mod tests {
             "😄"
         );
         assert_eq!(adjusted_range, Some(3..5));
+    }
+
+    #[gpui::test]
+    fn test_code_block_tabs_expand_to_tab_stops(cx: &mut TestAppContext) {
+        let rendered = render_markdown("```\n\tone\n\t\ttwo\nab\tthree\né\tx\n```", cx);
+        assert_eq!(
+            rendered.lines[0].layout.text(),
+            "    one\n        two\nab  three\né   x"
+        );
+    }
+
+    #[gpui::test]
+    fn test_code_block_tabs_follow_tab_size_setting(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.all_languages.defaults.tab_size = std::num::NonZeroU32::new(2);
+                });
+            });
+        });
+
+        let rendered = render_markdown("```\n\tone\n\t\ttwo\n```", cx);
+        assert_eq!(rendered.lines[0].layout.text(), "  one\n    two");
+    }
+
+    #[gpui::test]
+    fn test_code_block_tabs_map_to_source_and_copy_as_tabs(cx: &mut TestAppContext) {
+        let source = "```\n\tone\n```";
+        let rendered = render_markdown(source, cx);
+
+        // The tab at source index 4 renders as the four spaces before "one".
+        assert_mappings(&rendered, vec![vec![(0, 4), (4, 5), (5, 6), (6, 7)]]);
+        assert_eq!(rendered.lines[0].source_index_for_rendered_index(2), 5);
+
+        assert_eq!(rendered.text_for_range(0..source.len()), "\tone");
+        assert_eq!(rendered.text_for_range(5..8), "one");
+    }
+
+    #[gpui::test]
+    fn test_code_block_tab_expansion_keeps_highlights_aligned(cx: &mut TestAppContext) {
+        let source = "```rust\n\tlet x = 1;\n```";
+        let (language, markdown) = markdown_with_rust_language(source, cx);
+        let code_text = "\tlet x = 1;\n";
+        let code_start = source.find(code_text).unwrap();
+        let code_block_highlights = markdown.read_with(cx, |markdown, _| {
+            markdown.parsed_markdown().code_block_highlights.clone()
+        });
+
+        let mut builder = code_block_test_builder(code_block_highlights);
+        builder.push_code_block(Some(language), 4);
+        builder.push_text(code_text, code_start..code_start + code_text.len());
+
+        let pending_line = &builder.pending_line;
+        assert_eq!(pending_line.text, "    let x = 1;\n");
+        assert_eq!(
+            pending_line.runs.iter().map(|run| run.len).sum::<usize>(),
+            pending_line.text.len()
+        );
+        let mut run_start = 0;
+        let keyword_range = pending_line
+            .runs
+            .iter()
+            .find_map(|run| {
+                let range = run_start..run_start + run.len;
+                run_start = range.end;
+                (run.color == gpui::red()).then_some(range)
+            })
+            .expect("`let` should be highlighted as a keyword");
+        assert_eq!(&pending_line.text[keyword_range], "let");
+    }
+
+    #[test]
+    fn test_code_block_tab_stops_continue_across_text_chunks() {
+        let mut builder = code_block_test_builder(Arc::default());
+        builder.push_code_block(None, 4);
+        builder.push_text("ab", 0..2);
+        builder.push_text("\tc", 2..4);
+        assert_eq!(builder.pending_line.text, "ab  c");
+    }
+
+    fn code_block_test_builder(
+        code_block_highlights: Arc<CodeBlockHighlights>,
+    ) -> MarkdownElementBuilder {
+        MarkdownElementBuilder::new(
+            &StyleRefinement::default(),
+            TextStyle::default(),
+            Arc::new(rust_test_theme()),
+            MarkdownHighlights {
+                search_highlights: Rc::from([]),
+                active_search_highlight: None,
+                search_match_color: Hsla::default(),
+                active_search_match_color: Hsla::default(),
+                selection: None,
+                next_search_highlight_ix: 0,
+            },
+            code_block_highlights,
+        )
     }
 
     #[gpui::test]
